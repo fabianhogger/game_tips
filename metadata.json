@@ -1,0 +1,8 @@
+{
+  "uuid": "lock-intro@local",
+  "name": "Lock Intro",
+  "description": "Shows a wallpaper with a fading phrase when the screen locks, then reveals the normal lock screen.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 1
+}
