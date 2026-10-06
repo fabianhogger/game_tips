@@ -8,6 +8,9 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const CONFIG = {
     // Wallpaper shown only during the intro. Missing file => plain black.
     wallpaper: GLib.build_filenamev([GLib.get_home_dir(), 'Pictures', 'lock-intro.jpg']),
+    // Set to a string to always show that text instead of a random phrase.
+    // Handy for checking the fade; set back to null when you're done testing.
+    testPhrase: 'TEST \u2014 this text fades in, holds, then fades out',
     // One phrase is picked at random on every lock.
     phrases: [
         'Take a breath.',
@@ -20,6 +23,8 @@ const CONFIG = {
     textFadeOutMs: 1200,
     bgFadeOutMs: 800,
     fontSize: '44px',
+    // Distance from the bottom edge of the screen to the text.
+    bottomMarginPx: 120,
 };
 // ---------------------------------------------------------------------------
 
@@ -58,7 +63,8 @@ export default class LockIntro extends Extension {
         this._cleanup();
 
         const monitor = Main.layoutManager.primaryMonitor;
-        const phrase = CONFIG.phrases[Math.floor(Math.random() * CONFIG.phrases.length)];
+        const phrase = CONFIG.testPhrase ??
+            CONFIG.phrases[Math.floor(Math.random() * CONFIG.phrases.length)];
 
         const overlay = new St.Widget({
             reactive: false, // never swallows input; lock behaviour is untouched
@@ -79,9 +85,10 @@ export default class LockIntro extends Extension {
             x_expand: true,
             y_expand: true,
             x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.END,
             style: `font-size: ${CONFIG.fontSize}; font-weight: 300; color: white;` +
                    'max-width: 900px; text-align: center;' +
+                   `padding-bottom: ${CONFIG.bottomMarginPx}px;` +
                    'text-shadow: 0 2px 14px rgba(0,0,0,0.65);',
         });
         label.clutter_text.line_wrap = true;
