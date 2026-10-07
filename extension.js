@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Soup from 'gi://Soup?version=3.0';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -20,28 +21,30 @@ const CONFIG = {
     // shown in a shuffled rotation: every image appears before any repeats.
     imageExtensions: /\.(jpe?g|png|webp|bmp|tiff?|gif|avif)$/i,
     // Nothing usable in either location => plain black.
-    // Set to a string to always show that text instead of a feed tip.
+    // Set to a string to always show that text instead of a random phrase.
     // Handy for checking the fade; set back to null when you're done testing.
     testPhrase: null,
-    // Tips come from the `update-tips` script next to this file, which runs
-    // myrssfeed and writes the result here. The shell never fetches anything
-    // itself, so no lock ever waits on a feed.
-    // No file, or an empty one, means the image shows with no text at all.
-    tipsPath: GLib.getenv('LOCK_INTRO_TIPS') ??
-        GLib.build_filenamev([
-            GLib.get_user_cache_dir(), 'lock-intro', 'tips.json']),
-    // A headline longer than this wraps into a wall of text; skip it.
+    // One phrase is picked at random on every lock.
+    phrases: [
+        'Take a breath.',
+        'You did good work today.',
+        'Stay curious.',
+    ],
+    // Tech tips are pulled from this RSS feed and cached on disk, so the lock
+    // screen never waits on the network. `phrases` is the fallback when the
+    // cache is empty. Set feedUrl to null to use `phrases` only.
+    feedUrl: 'https://www.howtogeek.com/feed/',
+    feedRefreshHours: 6,
+    // The feed carries deal/discount posts alongside the tips; skip those.
+    feedSkip: /\$\d|\d+%\s*off|\bdeals?\b|\bdiscount|\bcoupon|\bsale\b/i,
     maxPhraseChars: 130,
-    // How often to run update-tips, in hours. 0 never runs it, for when you
-    // would rather drive it yourself from cron or by hand.
-    refreshHours: 6,
     bgFadeInMs: 700,
     textFadeInMs: 1200,
     holdMs: 2500,
     textFadeOutMs: 1200,
     bgFadeOutMs: 800,
     fontSize: '44px',
-    // Used instead of fontSize once a headline passes longPhraseChars.
+    // Feed headlines are far longer than the built-in phrases.
     fontSizeLong: '30px',
     longPhraseChars: 55,
     // Distance from the bottom edge of the screen to the text.
@@ -62,13 +65,12 @@ export default class LockIntro extends Extension {
         this._idleMonitor = global.backend.get_core_idle_monitor();
         this._tips = [];
         this._rotation = null;
-        this._tipsMonitor = null;
-        this._updater = null;
+        this._session = null;
+        this._cancellable = null;
         this._refreshFirstId = 0;
         this._refreshId = 0;
 
-        this._loadTips();
-        this._watchTips();
+        this._loadCache();
         this._scheduleRefresh();
 
         // Fires at the instant of locking. If you locked by hand you are
@@ -108,20 +110,15 @@ export default class LockIntro extends Extension {
         this._disarmWakeDetection();
         this._idleMonitor = null;
 
-        if (this._tipsMonitor) {
-            this._tipsMonitor.cancel();
-            this._tipsMonitor = null;
-        }
         for (const id of [this._refreshFirstId, this._refreshId]) {
             if (id)
                 GLib.source_remove(id);
         }
         this._refreshFirstId = 0;
         this._refreshId = 0;
-        if (this._updater) {
-            this._updater.force_exit();
-            this._updater = null;
-        }
+        this._cancellable?.cancel();
+        this._cancellable = null;
+        this._session = null; // in-flight callbacks bail out on this
         this._tips = [];
         this._rotation = null;
 
@@ -233,114 +230,119 @@ export default class LockIntro extends Extension {
         return files;
     }
 
-    // ---- tips ------------------------------------------------------------
-    //
-    // The tips are written by the update-tips script next to this file, which
-    // _runUpdater() spawns on a timer. Here they are only read, so a slow feed,
-    // a missing API key or a failed run can never delay or break a lock.
+    // ---- tip feed --------------------------------------------------------
 
-    // null when the pool is empty: the intro then runs without text rather
-    // than inventing something to say.
     _pickPhrase() {
-        if (!this._tips?.length)
-            return null;
-        return this._tips[Math.floor(Math.random() * this._tips.length)];
+        const pool = this._tips?.length ? this._tips : CONFIG.phrases;
+        return pool[Math.floor(Math.random() * pool.length)];
     }
 
-    _loadTips() {
-        this._tips = [];
-        let data;
+    _cachePath() {
+        return GLib.build_filenamev([
+            GLib.get_user_cache_dir(), 'lock-intro-tips.json']);
+    }
+
+    _loadCache() {
         try {
-            const [ok, bytes] = GLib.file_get_contents(CONFIG.tipsPath);
+            const [ok, data] = GLib.file_get_contents(this._cachePath());
             if (!ok)
                 return;
-            data = JSON.parse(new TextDecoder().decode(bytes));
+            const tips = JSON.parse(new TextDecoder().decode(data));
+            if (Array.isArray(tips))
+                this._tips = tips.filter(t => typeof t === 'string' && t);
         } catch (e) {
-            return; // not written yet: the intro runs without text
+            // No cache yet, or it is unreadable: CONFIG.phrases is the fallback.
         }
+    }
 
-        // Current format is {updated, tips: [{title, link}]}; a bare array of
-        // strings was the previous one and still reads.
-        const entries = Array.isArray(data) ? data : data?.tips;
-        if (!Array.isArray(entries))
-            return;
-
-        this._tips = entries
-            .map(e => (typeof e === 'string' ? e : e?.title))
-            .filter(t => typeof t === 'string')
-            .map(t => t.trim())
-            .filter(t => t && t.length <= CONFIG.maxPhraseChars);
+    _saveCache() {
+        try {
+            GLib.file_set_contents(
+                this._cachePath(), JSON.stringify(this._tips));
+        } catch (e) {
+            console.warn(`lock-intro: could not cache tips: ${e.message}`);
+        }
     }
 
     _scheduleRefresh() {
-        if (!CONFIG.refreshHours)
+        if (!CONFIG.feedUrl)
             return;
-        // A short delay first, so a login is never held up by a feed fetch.
+        // Shortly after login, so it never delays the session starting up.
         this._refreshFirstId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_LOW, 20, () => {
+            GLib.PRIORITY_LOW, 15, () => {
                 this._refreshFirstId = 0;
-                this._runUpdater();
+                this._refreshTips();
                 return GLib.SOURCE_REMOVE;
             });
         this._refreshId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_LOW, CONFIG.refreshHours * 3600, () => {
-                this._runUpdater();
+            GLib.PRIORITY_LOW,
+            Math.max(1, CONFIG.feedRefreshHours) * 3600, () => {
+                this._refreshTips();
                 return GLib.SOURCE_CONTINUE;
             });
     }
 
-    // Spawned, not done in process: the fetching and the judging live in a
-    // Python script with its own dependencies, and neither belongs in the
-    // compositor. Failures here only mean the tips stay as they were.
-    _runUpdater() {
-        if (this._updater)
-            return; // the previous run has not finished
-
-        const script = GLib.build_filenamev([this.path, 'update-tips']);
-        if (!GLib.file_test(script, GLib.FileTest.IS_EXECUTABLE)) {
-            console.warn(`lock-intro: ${script} is missing or not executable`);
-            return;
-        }
-
-        try {
-            this._updater = Gio.Subprocess.new(
-                [script], Gio.SubprocessFlags.STDERR_PIPE);
-        } catch (e) {
-            console.warn(`lock-intro: cannot run update-tips: ${e.message}`);
-            return;
-        }
-
-        this._updater.communicate_utf8_async(null, null, (proc, res) => {
-            this._updater = null;
-            try {
-                const [, , stderr] = proc.communicate_utf8_finish(res);
-                if (!proc.get_successful()) {
-                    console.warn(
-                        `lock-intro: update-tips failed: ${(stderr ?? '').trim()}`);
-                }
-            } catch (e) {
-                console.warn(`lock-intro: update-tips: ${e.message}`);
-            }
-        });
+    // RSS titles arrive CDATA-wrapped and may carry entity references.
+    _cleanTitle(raw) {
+        const named = {amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' '};
+        return raw
+            .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&#x([0-9a-f]+);/gi,
+                (_, h) => String.fromCodePoint(parseInt(h, 16)))
+            .replace(/&#(\d+);/g,
+                (_, d) => String.fromCodePoint(parseInt(d, 10)))
+            .replace(/&(amp|lt|gt|quot|apos|nbsp);/g, (_, n) => named[n])
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
-    // Pick up a refreshed pool without waiting for the next shell restart.
-    // update-tips writes through a temp file and renames, so what lands here
-    // is always a complete file.
-    _watchTips() {
-        try {
-            const file = Gio.File.new_for_path(CONFIG.tipsPath);
-            this._tipsMonitor = file.monitor_file(Gio.FileMonitorFlags.NONE, null);
-            this._tipsMonitor.connect('changed', (_monitor, _f, _other, type) => {
-                if (type === Gio.FileMonitorEvent.CHANGES_DONE_HINT ||
-                    type === Gio.FileMonitorEvent.CREATED ||
-                    type === Gio.FileMonitorEvent.MOVED_IN ||
-                    type === Gio.FileMonitorEvent.DELETED)
-                    this._loadTips();
+    _refreshTips() {
+        if (!CONFIG.feedUrl || this._cancellable)
+            return; // already fetching
+
+        this._session ??= new Soup.Session({
+            timeout: 20,
+            user_agent: 'gnome-shell-lock-intro/1',
+        });
+        const session = this._session;
+        const msg = Soup.Message.new('GET', CONFIG.feedUrl);
+        this._cancellable = new Gio.Cancellable();
+
+        session.send_and_read_async(
+            msg, GLib.PRIORITY_LOW, this._cancellable, (_s, res) => {
+                if (this._session !== session)
+                    return; // disabled while the request was in flight
+                this._cancellable = null;
+
+                let bytes;
+                try {
+                    bytes = session.send_and_read_finish(res);
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.warn(`lock-intro: feed fetch failed: ${e.message}`);
+                    return; // keep whatever is cached
+                }
+                if (msg.get_status() !== Soup.Status.OK) {
+                    console.warn(`lock-intro: feed returned ${msg.get_status()}`);
+                    return;
+                }
+
+                const xml = new TextDecoder().decode(bytes.get_data());
+                const tips = [...xml.matchAll(
+                    /<item>[\s\S]*?<title>([\s\S]*?)<\/title>/g)]
+                    .map(m => this._cleanTitle(m[1]))
+                    .filter(t => t &&
+                        t.length <= CONFIG.maxPhraseChars &&
+                        !CONFIG.feedSkip.test(t));
+
+                if (!tips.length) {
+                    console.warn('lock-intro: feed had no usable tips');
+                    return;
+                }
+                this._tips = tips;
+                this._saveCache();
             });
-        } catch (e) {
-            console.warn(`lock-intro: cannot watch ${CONFIG.tipsPath}: ${e.message}`);
-        }
     }
 
     _maybePlay() {
@@ -367,9 +369,6 @@ export default class LockIntro extends Extension {
         const phrase = CONFIG.testPhrase ?? this._pickPhrase();
         const image = this._nextImageUri();
 
-        if (!phrase && !image)
-            return; // nothing to show; leave the normal lock screen alone
-
         const overlay = new St.Widget({
             reactive: false, // never swallows input; lock behaviour is untouched
             x: monitor.x,
@@ -383,7 +382,7 @@ export default class LockIntro extends Extension {
                    'background-size: cover;',
         });
 
-        const label = phrase ? new St.Label({
+        const label = new St.Label({
             text: phrase,
             opacity: 0,
             x_expand: true,
@@ -396,11 +395,9 @@ export default class LockIntro extends Extension {
                    'max-width: 900px; text-align: center;' +
                    `padding-bottom: ${CONFIG.bottomMarginPx}px;` +
                    'text-shadow: 0 2px 14px rgba(0,0,0,0.65);',
-        }) : null;
-        if (label) {
-            label.clutter_text.line_wrap = true;
-            overlay.add_child(label);
-        }
+        });
+        label.clutter_text.line_wrap = true;
+        overlay.add_child(label);
 
         Main.layoutManager.screenShieldGroup.add_child(overlay);
         this._overlay = overlay;
@@ -423,14 +420,6 @@ export default class LockIntro extends Extension {
             opacity: 255, duration: CONFIG.bgFadeInMs, mode,
             onComplete: () => {
                 if (!alive()) return;
-                if (!label) {
-                    // No text: hold the image, then fade it away.
-                    this._later(CONFIG.holdMs, () => {
-                        if (alive())
-                            this._fadeOutOverlay(overlay);
-                    });
-                    return;
-                }
                 label.ease({
                     opacity: 255, duration: CONFIG.textFadeInMs, mode,
                     onComplete: () => {
