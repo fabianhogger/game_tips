@@ -8,8 +8,19 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // ---- Edit these -----------------------------------------------------------
 const CONFIG = {
-    // Wallpaper shown only during the intro. Missing file => plain black.
-    wallpaper: GLib.build_filenamev([GLib.get_home_dir(), 'Pictures', 'lock-intro.jpg']),
+    // Where the intro image comes from. $LOCK_INTRO_WALLPAPER overrides this
+    // and may name either a directory or a single image file.
+    // NOTE: gnome-shell does not inherit your terminal's environment; set the
+    // variable in ~/.config/environment.d/ so the session exports it (README).
+    wallpaper: GLib.getenv('LOCK_INTRO_WALLPAPER') ??
+        GLib.build_filenamev([GLib.get_home_dir(), 'Pictures', 'lock-intro']),
+    // Used when the above does not exist, so a single-file setup keeps working.
+    wallpaperFallback: GLib.build_filenamev([
+        GLib.get_home_dir(), 'Pictures', 'lock-intro.jpg']),
+    // Which files count as images when `wallpaper` is a directory. They are
+    // shown in a shuffled rotation: every image appears before any repeats.
+    imageExtensions: /\.(jpe?g|png|webp|bmp|tiff?|gif|avif)$/i,
+    // Nothing usable in either location => plain black.
     // Set to a string to always show that text instead of a random phrase.
     // Handy for checking the fade; set back to null when you're done testing.
     testPhrase: null,
@@ -53,6 +64,7 @@ export default class LockIntro extends Extension {
         this._idleGateId = 0;
         this._idleMonitor = global.backend.get_core_idle_monitor();
         this._tips = [];
+        this._rotation = null;
         this._session = null;
         this._cancellable = null;
         this._refreshFirstId = 0;
@@ -108,6 +120,7 @@ export default class LockIntro extends Extension {
         this._cancellable = null;
         this._session = null; // in-flight callbacks bail out on this
         this._tips = [];
+        this._rotation = null;
 
         this._cleanup();
     }
@@ -155,6 +168,66 @@ export default class LockIntro extends Extension {
             this._idleMonitor.remove_watch(this._userActiveId);
             this._userActiveId = 0;
         }
+    }
+
+    // ---- wallpaper rotation ----------------------------------------------
+
+    // Returns a file:// URI for the next image, or null for a plain black
+    // background. Resolved per lock, so dropping files in takes effect at once.
+    _nextImageUri() {
+        for (const path of [CONFIG.wallpaper, CONFIG.wallpaperFallback]) {
+            if (!path)
+                continue;
+            let file = null;
+            if (GLib.file_test(path, GLib.FileTest.IS_DIR))
+                file = this._nextFromDir(path);
+            else if (GLib.file_test(path, GLib.FileTest.EXISTS))
+                file = path;
+            if (file) {
+                try {
+                    // Escapes spaces and quotes that would break the CSS url().
+                    return GLib.filename_to_uri(file, null);
+                } catch (e) {
+                    console.warn(`lock-intro: bad image path ${file}: ${e.message}`);
+                }
+            }
+        }
+        return null;
+    }
+
+    // Hands out each image once, in a random order, then reshuffles. Beats a
+    // plain random pick, which happily shows the same image twice in a row.
+    _nextFromDir(dir) {
+        if (this._rotation?.dir !== dir || !this._rotation.queue.length) {
+            const files = this._scanDir(dir);
+            if (!files.length)
+                return null;
+            for (let i = files.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [files[i], files[j]] = [files[j], files[i]];
+            }
+            this._rotation = {dir, queue: files};
+        }
+        return this._rotation.queue.pop();
+    }
+
+    _scanDir(dir) {
+        const files = [];
+        try {
+            const handle = GLib.Dir.open(dir, 0);
+            let name;
+            while ((name = handle.read_name()) !== null) {
+                if (!CONFIG.imageExtensions.test(name))
+                    continue;
+                const path = GLib.build_filenamev([dir, name]);
+                if (!GLib.file_test(path, GLib.FileTest.IS_DIR))
+                    files.push(path);
+            }
+            handle.close();
+        } catch (e) {
+            console.warn(`lock-intro: cannot read ${dir}: ${e.message}`);
+        }
+        return files;
     }
 
     // ---- tip feed --------------------------------------------------------
@@ -294,6 +367,7 @@ export default class LockIntro extends Extension {
 
         const monitor = Main.layoutManager.primaryMonitor;
         const phrase = CONFIG.testPhrase ?? this._pickPhrase();
+        const image = this._nextImageUri();
 
         const overlay = new St.Widget({
             reactive: false, // never swallows input; lock behaviour is untouched
@@ -304,7 +378,7 @@ export default class LockIntro extends Extension {
             opacity: 0,
             layout_manager: new Clutter.BinLayout(),
             style: 'background-color: black;' +
-                   `background-image: url("file://${CONFIG.wallpaper}");` +
+                   (image ? `background-image: url("${image}");` : '') +
                    'background-size: cover;',
         });
 
