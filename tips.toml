@@ -1,0 +1,34 @@
+# Which feed items become lock screen tips.
+#
+# Read by update-tips via myrssfeed, which asks Claude to judge each item
+# against system_prompt below. This replaced a keyword regex that could not
+# tell "5 Android tweaks that cut my eye strain" from "46% off a DeWalt set".
+
+system_prompt = """
+These headlines are shown one at a time on a lock screen, as a tip worth
+knowing. Keep an item only if its headline teaches or points to something
+practical: a setting to change, a tool or technique worth knowing, a way to do
+something better, a self-hosting or hardware project, a security practice.
+
+Skip:
+  - deals, discounts, sales, price drops, and anything with a price in it
+  - product announcements, funding, company and industry news
+  - reviews and buying guides
+  - opinion and personal essays with no technique in them
+  - streaming and entertainment recommendations
+
+The headline is all the reader sees, so skip items whose headline is pure
+curiosity bait and names nothing concrete.
+"""
+
+feeds = [
+  "https://til.hashrocket.com/rss",
+]
+
+# Classification needs little thinking; this keeps a run to a cent or two.
+model = "claude-haiku-4-5-20251001"
+effort = "low"
+batch_size = 10
+include_reasons = false
+
+output_format = "json"

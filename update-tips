@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Refresh the lock screen tips.
+
+Runs myrssfeed (https://github.com/fabianhogger/myrssfeed) over the feeds in
+tips.toml and writes what comes back to ~/.cache/lock-intro/tips.json, which
+the GNOME Shell extension reads.
+
+The file is a snapshot of the last run, not an archive: each run replaces it.
+Nothing accumulates, so a feed that has stopped carrying tips ends up showing
+no tips rather than last month's. An empty result is written as an empty list,
+and the lock screen then shows the image with no text.
+
+With --no-filter it takes every item the feeds offer and never calls the API,
+so this works with no Anthropic key at all. --skip/LOCK_INTRO_SKIP can drop
+titles by regex in that mode, which is cruder than judging them and is the
+trade.
+
+The extension runs this itself every few hours. Running it by hand works too;
+the extension notices the new file and uses it at the next lock.
+
+Stdlib only -- it has to run under whatever python3 the session happens to
+have, while myrssfeed itself lives in its own pipx environment.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_CONFIG = HERE / "tips.toml"
+DEFAULT_OUT = Path(
+    os.environ.get("LOCK_INTRO_TIPS")
+    or Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    / "lock-intro"
+    / "tips.json"
+).expanduser()
+# No default pattern: what is worth skipping depends on the feed, and the feeds
+# are configured in tips.toml. Set LOCK_INTRO_SKIP or pass --skip.
+DEFAULT_SKIP = ""
+# myrssfeed exits 3 when it ran but some feed or batch failed. Whatever it did
+# manage to judge is on stdout and worth keeping.
+OK_EXIT_CODES = (0, 3)
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def find_myrssfeed() -> str:
+    """Locate the CLI, including the pipx bin dir that a service may not have."""
+    explicit = os.environ.get("MYRSSFEED_BIN")
+    if explicit:
+        return explicit
+    found = shutil.which("myrssfeed")
+    if found:
+        return found
+    candidate = Path.home() / ".local" / "bin" / "myrssfeed"
+    if candidate.is_file():
+        return str(candidate)
+    sys.exit("myrssfeed not found; install it with: pipx install myrssfeed")
+
+
+def run_myrssfeed(config: Path, timeout: int, unjudged: bool) -> list:
+    """Run one pass over every feed.
+
+    `unjudged` returns the raw items without calling the API -- myrssfeed's
+    --dry-run, which is both the preview and the no-key mode.
+
+    --no-state asks for every current item, not just the ones since last time.
+    The output replaces the tip file, so a run that returned only new items
+    would throw away everything else.
+    """
+    cmd = [
+        find_myrssfeed(),
+        "--config", str(config),
+        "--once",
+        "--format", "json",
+        "--no-state",
+    ]
+    if unjudged:
+        cmd.append("--dry-run")
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        sys.exit(f"myrssfeed timed out after {timeout}s")
+
+    if proc.stderr.strip():
+        print(proc.stderr.strip(), file=sys.stderr)
+    if proc.returncode not in OK_EXIT_CODES:
+        sys.exit(f"myrssfeed failed (exit {proc.returncode})")
+    if not proc.stdout.strip():
+        return []
+    try:
+        items = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"could not parse myrssfeed output: {exc}")
+    return items if isinstance(items, list) else []
+
+
+def apply_skip(items: list, pattern: str) -> list:
+    """Drop items whose title matches `pattern`. Used only without judging."""
+    if not pattern:
+        return items
+    try:
+        skip = re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        sys.exit(f"bad --skip pattern: {exc}")
+    return [i for i in items if not skip.search(str(i.get("title", "")))]
+
+
+def to_tips(items: list) -> list:
+    tips = []
+    for item in items:
+        title = str(item.get("title", "")).strip()
+        if title:
+            tips.append({"title": title, "link": str(item.get("link", ""))})
+    return tips
+
+
+def write_tips(path: Path, tips: list) -> None:
+    """Write via a temp file and rename, so the extension never reads a half-file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tips": tips,
+    }
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tips-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="seconds to allow myrssfeed (default 300)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="print what would be collected; no write")
+    parser.add_argument("--no-filter", action="store_true",
+                        default=env_flag("LOCK_INTRO_NO_FILTER"),
+                        help="keep every item instead of asking Claude to judge; "
+                             "needs no API key (env: LOCK_INTRO_NO_FILTER=1)")
+    parser.add_argument("--skip", metavar="REGEX",
+                        default=os.environ.get("LOCK_INTRO_SKIP", DEFAULT_SKIP),
+                        help="with --no-filter, drop titles matching this regex "
+                             "(env: LOCK_INTRO_SKIP); default keeps everything")
+    args = parser.parse_args()
+
+    if not args.config.is_file():
+        sys.exit(f"config not found: {args.config}")
+
+    # Judging costs money, so a preview run never does it either.
+    unjudged = args.no_filter or args.dry_run
+    items = run_myrssfeed(args.config, args.timeout, unjudged)
+
+    if args.no_filter:
+        kept = apply_skip(items, args.skip)
+        print(f"no-filter: {len(kept)} kept, {len(items) - len(kept)} skipped",
+              file=sys.stderr)
+        items = kept
+
+    tips = to_tips(items)
+
+    if args.dry_run:
+        verb = "collected" if args.no_filter else "judged"
+        print(f"{len(tips)} item(s) would be {verb}; nothing written")
+        for tip in tips:
+            print(f"  - {tip['title']}")
+        return 0
+
+    write_tips(args.out, tips)
+    print(f"{len(tips)} tip(s) -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
